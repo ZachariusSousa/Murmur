@@ -7,11 +7,27 @@ the same contract can later be moved across machines.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 import random
 
 import torch
 import torch.nn.functional as F
+
+
+@dataclass(frozen=True)
+class TokenCommit:
+    position: int
+    token_id: int
+    source: str
+
+
+@dataclass(frozen=True)
+class StepTrace:
+    step: int
+    masks_remaining: int
+    active_nodes: int
+    committed_tokens: tuple[TokenCommit, ...]
 
 
 @dataclass(frozen=True)
@@ -136,7 +152,7 @@ def swarm_generate(
     enable_peer: bool,
     peer_dropout: float = 0.0,
     peer_model: object | None = None,
-) -> SwarmResult:
+) -> Iterator[StepTrace | SwarmResult]:
     """Run a batch-size-one Dream entropy schedule with optional proposals."""
     if input_ids.shape[0] != 1:
         raise ValueError("the local swarm experiment supports batch size 1 only")
@@ -174,7 +190,6 @@ def swarm_generate(
     for step in range(steps):
         mask_index = x == mask_token_id
         if not torch.any(mask_index):
-            active_nodes_per_step.extend([1] * (steps - step))
             break
 
         primary_logits = _model_logits(
@@ -220,6 +235,7 @@ def swarm_generate(
 
         active_nodes_per_step.append(1 + len(peers))
         combined = combine_proposals(primary, peers)
+        step_commits: list[TokenCommit] = []
 
         remaining = int(mask_index.sum().item())
         if step < steps - 1:
@@ -249,7 +265,26 @@ def swarm_generate(
             total_peer_wins += int(
                 peer_winners[rows, transfer_index].sum().item()
             )
+            for position in transfer_index[0].tolist():
+                step_commits.append(
+                    TokenCommit(
+                        position=position,
+                        token_id=int(candidates[0, position].item()),
+                        source=(
+                            "peer"
+                            if bool(peer_winners[0, position].item())
+                            else "primary"
+                        ),
+                    )
+                )
             x[rows, transfer_index] = candidates[rows, transfer_index]
+
+        yield StepTrace(
+            step=step,
+            masks_remaining=int((x == mask_token_id).sum().item()),
+            active_nodes=1 + len(peers),
+            committed_tokens=tuple(step_commits),
+        )
 
     if x.shape[1] != max_length or not torch.equal(
         x[:, :prompt_length], input_ids
@@ -258,7 +293,7 @@ def swarm_generate(
     if torch.any(x[:, prompt_length:] == mask_token_id):
         raise RuntimeError("the coordinator left unresolved mask tokens")
 
-    return SwarmResult(
+    yield SwarmResult(
         sequences=x,
         active_nodes_per_step=active_nodes_per_step,
         peer_wins=total_peer_wins,

@@ -78,6 +78,12 @@ class FailingPeer:
         raise RuntimeError("peer disappeared")
 
 
+def completed_result(model, **kwargs):
+    from swarm_sampler import swarm_generate
+
+    return list(swarm_generate(model, **kwargs))[-1]
+
+
 class SwarmGenerationTests(unittest.TestCase):
     def setUp(self):
         self.input_ids = torch.tensor([[1, 2]])
@@ -95,20 +101,43 @@ class SwarmGenerationTests(unittest.TestCase):
         )
 
     def test_one_node_completes_without_peer_and_preserves_prompt(self):
-        from swarm_sampler import swarm_generate
-
-        result = swarm_generate(TinyModel(), enable_peer=False, **self.common)
+        result = completed_result(TinyModel(), enable_peer=False, **self.common)
 
         self.assertEqual(result.active_nodes_per_step, [1, 1, 1, 1])
         self.assertEqual(result.peer_wins, 0)
         self.assertEqual(result.sequences[0, :2].tolist(), [1, 2])
         self.assertNotIn(5, result.sequences[0, 2:].tolist())
 
+    def test_generation_streams_each_committed_step_before_final_result(self):
+        from collections.abc import Iterator
+        from swarm_sampler import SwarmResult, swarm_generate
+
+        stream = swarm_generate(
+            TinyModel(), enable_peer=True, peer_dropout=0.0, **self.common
+        )
+        self.assertIsInstance(stream, Iterator)
+
+        events = list(stream)
+        traces = [event for event in events if hasattr(event, "committed_tokens")]
+        result = events[-1]
+
+        self.assertEqual(len(traces), 4)
+        self.assertEqual([trace.step for trace in traces], [0, 1, 2, 3])
+        self.assertEqual([trace.masks_remaining for trace in traces], [4, 3, 2, 0])
+        self.assertEqual([trace.active_nodes for trace in traces], [2, 2, 2, 2])
+        self.assertIsInstance(result, SwarmResult)
+        committed = [token for trace in traces for token in trace.committed_tokens]
+        self.assertEqual(sorted(token.position for token in committed), [2, 3, 4, 5])
+        self.assertTrue(all(token.source in {"primary", "peer"} for token in committed))
+        self.assertEqual(
+            sum(token.source == "peer" for token in committed), result.peer_wins
+        )
+
     def test_full_peer_dropout_exactly_matches_one_node(self):
         from swarm_sampler import swarm_generate
 
-        baseline = swarm_generate(TinyModel(), enable_peer=False, **self.common)
-        dropped = swarm_generate(
+        baseline = completed_result(TinyModel(), enable_peer=False, **self.common)
+        dropped = completed_result(
             TinyModel(), enable_peer=True, peer_dropout=1.0, **self.common
         )
 
@@ -116,9 +145,7 @@ class SwarmGenerationTests(unittest.TestCase):
         self.assertEqual(dropped.active_nodes_per_step, [1, 1, 1, 1])
 
     def test_zero_dropout_invokes_both_nodes_every_step(self):
-        from swarm_sampler import swarm_generate
-
-        result = swarm_generate(
+        result = completed_result(
             TinyModel(), enable_peer=True, peer_dropout=0.0, **self.common
         )
 
@@ -126,10 +153,8 @@ class SwarmGenerationTests(unittest.TestCase):
         self.assertGreater(result.peer_wins, 0)
 
     def test_failed_peer_is_ignored(self):
-        from swarm_sampler import swarm_generate
-
-        baseline = swarm_generate(TinyModel(), enable_peer=False, **self.common)
-        with_failure = swarm_generate(
+        baseline = completed_result(TinyModel(), enable_peer=False, **self.common)
+        with_failure = completed_result(
             TinyModel(),
             enable_peer=True,
             peer_dropout=0.0,
