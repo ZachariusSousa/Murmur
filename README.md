@@ -127,5 +127,28 @@ if ($LASTEXITCODE -eq 0) { throw "Expected the VRAM gate to fail" }
   anonymous downloads, so stale saved credentials are ignored. Retry first;
   authentication is not currently required for this checkpoint.
 
-This milestone intentionally has no CPU path, server, UI, training code, or
-distributed contributor abstraction.
+This milestone intentionally has no CPU path, network service, training code,
+or distributed contributor abstraction beyond the local coordinator experiment.
+
+## Live browser experiment view
+
+Launch the local browser UI from PowerShell:
+
+```powershell
+cd C:\Murmur
+.\.uv-bootstrap\Scripts\uv.exe run python .\app.py
+```
+
+Open the local address printed in the terminal. The model is loaded only after
+the first **Run comparison** click, then reused while the app stays open. The
+page streams committed token IDs, masks remaining, and active contributors,
+then shows each scenario's text, peer commits, token differences, elapsed
+time, and peak PyTorch-reserved VRAM. These are observations, not quality
+scores.
+
+The current two-node run calls both proposals **sequentially** on one loaded
+model; it is not parallel execution. On the RTX 4090 Laptop GPU, a prior
+64-token/64-step run took 12.52 seconds for baseline, 24.92 seconds for two
+always-active sequential nodes, and 18.94 seconds with 50% peer dropout. That
+latency cost is why parallel execution—eventually with two model copies or
+separate PCs—is an important next experiment.
