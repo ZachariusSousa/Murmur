@@ -1,0 +1,23 @@
+[project]
+name = "dream-8gb-prototype"
+version = "0.1.0"
+description = "Minimal sub-8GB VRAM prototype for Dream 7B diffusion inference"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "accelerate==1.1.1",
+    "bitsandbytes==0.45.5",
+    "torch==2.5.1",
+    "transformers==4.46.2",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+

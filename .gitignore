@@ -1,0 +1,7 @@
+.venv/
+.uv-bootstrap/
+.uv-cache/
+.tmp/
+__pycache__/
+*.py[cod]
+
