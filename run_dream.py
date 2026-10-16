@@ -116,7 +116,9 @@ def load_dream_model_and_tokenizer(
     return model, tokenizer
 
 
-def prepare_prompt(tokenizer: object, prompt: str) -> tuple[object, object]:
+def prepare_prompt(
+    tokenizer: object, prompt: str, *, device: str = CUDA_DEVICE
+) -> tuple[object, object]:
     messages = [{"role": "user", "content": prompt}]
     inputs = tokenizer.apply_chat_template(
         messages,
@@ -125,8 +127,8 @@ def prepare_prompt(tokenizer: object, prompt: str) -> tuple[object, object]:
         add_generation_prompt=True,
     )
     return (
-        inputs.input_ids.to(CUDA_DEVICE),
-        inputs.attention_mask.to(CUDA_DEVICE),
+        inputs.input_ids.to(device),
+        inputs.attention_mask.to(device),
     )
 
 
