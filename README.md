@@ -59,14 +59,20 @@ uv run python -m unittest discover -s tests -v
 
 ## Run the two-node coordination experiment
 
-This reuses one loaded model to simulate two independent nodes sequentially.
-Both see the same partially masked text and sample with different seeds. At
+This loads two separate 4-bit copies of the same Dream checkpoint on GPU 0.
+Both see the same partially masked text, run their forward passes concurrently,
+and sample with different seeds. At
 each masked position, the coordinator keeps the available proposal with the
 higher token probability. It automatically compares:
 
 1. the primary node alone;
 2. both nodes on every diffusion step; and
 3. both nodes with the peer absent on 50% of steps by default.
+4. a single-node remasking run, compared with the baseline.
+
+The two-model experiment defaults to a 16 GiB VRAM budget; set
+`--max-vram-gb` lower if you want a stricter gate. The single-model baseline
+command above remains under the original 8 GiB target.
 
 Use the local `uv` executable that is already installed in this project:
 
@@ -94,9 +100,30 @@ absent). The script prints generated text, runtime, the active-node count for
 every step, peer proposals actually committed to the sequence, output-token
 differences from the baseline, and peak PyTorch VRAM for each run.
 
+The remasking run uses `--remask-fraction` (default `0.05`) as a one-time
+revision budget: it can reopen at most `floor(max-new-tokens × fraction)`
+generated positions, choosing the currently least-likely committed token, then
+predicts it again from a mask on the next step. Short outputs may round down to
+zero revisions. Set it to `0` for an unchanged one-node run or increase it to
+experiment. Prompt tokens are never eligible. The comparison also reports how
+many tokens were remasked and the first EOS token's zero-based position in the
+raw output, so an early display cutoff is visible.
+
 The two nodes currently share weights. This proves the coordinator, independent
 sampling, and graceful dropout behavior; it does not yet prove learned
 specialization or better output quality.
+
+### First two-copy GPU measurement
+
+In the latest supplied RTX 4090 Laptop GPU run, 16 output tokens and 16 steps
+took 6.71 s for the one-node baseline and 12.54 s with both copies available
+on every step (about 1.87x as long). The copies produced identical output and
+the peer won zero commits at the default temperature. PyTorch peak reserved
+memory was 11.00 GiB for the always-available run and 11.04 GiB for the second
+two-node run. `nvidia-smi` showed about 15.9 GiB in use during a run, including
+memory outside PyTorch's accounting, so other GPU users leave very little room.
+A cold first run was much slower and should not be compared with these warmed
+timings.
 
 ## What the memory number means
 
@@ -143,12 +170,12 @@ Open the local address printed in the terminal. The model is loaded only after
 the first **Run comparison** click, then reused while the app stays open. The
 page streams committed token IDs, masks remaining, and active contributors,
 then shows each scenario's text, peer commits, token differences, elapsed
-time, and peak PyTorch-reserved VRAM. These are observations, not quality
-scores.
+time, remasked-token count, first EOS position, and peak PyTorch-reserved VRAM.
+Use the remask budget slider to change how many tokens the single-node
+remasking run may reopen. These are observations, not quality scores.
 
-The current two-node run calls both proposals **sequentially** on one loaded
-model; it is not parallel execution. On the RTX 4090 Laptop GPU, a prior
-64-token/64-step run took 12.52 seconds for baseline, 24.92 seconds for two
-always-active sequential nodes, and 18.94 seconds with 50% peer dropout. That
-latency cost is why parallel execution—eventually with two model copies or
-separate PCs—is an important next experiment.
+The two-node run uses CUDA streams to launch the separate model forwards
+concurrently on one GPU. This is a local concurrency experiment, not a promise
+of speedup: both models still compete for the same GPU compute and memory
+bandwidth. Its measured runtime and peak reserved VRAM show the actual cost on
+the current machine.

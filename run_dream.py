@@ -95,6 +95,8 @@ def load_dream_model_and_tokenizer(
     auto_model: object,
     auto_tokenizer: object,
     quantization_config_class: object,
+    *,
+    tokenizer: object | None = None,
 ) -> tuple[object, object]:
     """Load the shared 4-bit Dream components used by both experiments."""
     quantization = quantization_config_class(
@@ -104,7 +106,8 @@ def load_dream_model_and_tokenizer(
         bnb_4bit_use_double_quant=True,
     )
     hub_kwargs = public_hugging_face_kwargs()
-    tokenizer = auto_tokenizer.from_pretrained(MODEL_ID, **hub_kwargs)
+    if tokenizer is None:
+        tokenizer = auto_tokenizer.from_pretrained(MODEL_ID, **hub_kwargs)
     model = auto_model.from_pretrained(
         MODEL_ID,
         device_map={"": 0},

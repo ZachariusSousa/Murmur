@@ -8,8 +8,10 @@ the same contract can later be moved across machines.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import random
+import time
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +30,8 @@ class StepTrace:
     masks_remaining: int
     active_nodes: int
     committed_tokens: tuple[TokenCommit, ...]
+    elapsed_seconds: float = 0.0
+    remasked_positions: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,7 @@ class SwarmResult:
     active_nodes_per_step: list[int]
     peer_wins: int
     peer_failures: int
+    remasked_tokens: int = 0
 
 
 def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -137,6 +142,65 @@ def _model_logits(model: object, x: torch.Tensor, attention_mask: object,
     return model(x, attention_mask, token_indices).logits
 
 
+def _model_logits_on_stream(
+    model: object,
+    x: torch.Tensor,
+    attention_mask: object,
+    token_indices: torch.Tensor | None,
+    stream: object | None,
+) -> torch.Tensor:
+    with torch.inference_mode():
+        if stream is None:
+            return _model_logits(model, x, attention_mask, token_indices)
+        with torch.cuda.stream(stream):
+            return _model_logits(model, x, attention_mask, token_indices)
+
+
+def _parallel_model_logits(
+    primary_model: object,
+    peer_model: object,
+    x: torch.Tensor,
+    attention_mask: object,
+    token_indices: torch.Tensor | None,
+    primary_stream: object | None,
+    peer_stream: object | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, Exception | None]:
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        primary_future = workers.submit(
+            _model_logits_on_stream,
+            primary_model,
+            x,
+            attention_mask,
+            token_indices,
+            primary_stream,
+        )
+        peer_future = workers.submit(
+            _model_logits_on_stream,
+            peer_model,
+            x,
+            attention_mask,
+            token_indices,
+            peer_stream,
+        )
+        primary_logits = primary_future.result()
+        peer_error: Exception | None = None
+        try:
+            peer_logits = peer_future.result()
+        except Exception as exc:
+            peer_logits = None
+            peer_error = exc
+
+    if primary_stream is not None:
+        primary_stream.synchronize()
+    if peer_stream is not None and peer_logits is not None:
+        try:
+            peer_stream.synchronize()
+        except Exception as exc:
+            peer_logits = None
+            peer_error = exc
+    return primary_logits, peer_logits, peer_error
+
+
 def swarm_generate(
     model: object,
     *,
@@ -152,12 +216,15 @@ def swarm_generate(
     enable_peer: bool,
     peer_dropout: float = 0.0,
     peer_model: object | None = None,
+    remask_fraction: float = 0.0,
 ) -> Iterator[StepTrace | SwarmResult]:
     """Run a batch-size-one Dream entropy schedule with optional proposals."""
     if input_ids.shape[0] != 1:
         raise ValueError("the local swarm experiment supports batch size 1 only")
     if not 0.0 <= peer_dropout <= 1.0:
         raise ValueError("peer_dropout must be between 0 and 1")
+    if not 0.0 <= remask_fraction <= 1.0:
+        raise ValueError("remask_fraction must be between 0 and 1")
 
     prompt_length = input_ids.shape[1]
     max_length = prompt_length + max_new_tokens
@@ -182,22 +249,51 @@ def swarm_generate(
     dropout_generator = random.Random(primary_seed + 1_000_003)
     timesteps = torch.linspace(1.0, 0.001, steps + 1, device=x.device)
     actual_peer_model = model if peer_model is None else peer_model
+    if enable_peer and x.is_cuda:
+        primary_stream = torch.cuda.Stream(device=x.device)
+        peer_stream = torch.cuda.Stream(device=x.device)
+    else:
+        primary_stream = peer_stream = None
 
     active_nodes_per_step: list[int] = []
     total_peer_wins = 0
     peer_failures = 0
+    remasked_tokens = 0
+    remasked_once = torch.zeros_like(x, dtype=torch.bool)
+    remask_budget = min(max_new_tokens, int(max_new_tokens * remask_fraction))
 
     for step in range(steps):
+        step_started = time.perf_counter()
         mask_index = x == mask_token_id
         if not torch.any(mask_index):
             break
 
-        primary_logits = _model_logits(
-            model, x, prepared_attention, token_indices
+        peer_requested = enable_peer and dropout_generator.random() >= peer_dropout
+        peer_output_logits = None
+        if peer_requested:
+            primary_output_logits, peer_output_logits, peer_error = (
+                _parallel_model_logits(
+                    model,
+                    actual_peer_model,
+                    x,
+                    prepared_attention,
+                    token_indices,
+                    primary_stream,
+                    peer_stream,
+                )
+            )
+            if peer_error is not None:
+                peer_failures += 1
+                peer_output_logits = None
+        else:
+            primary_output_logits = _model_logits(
+                model, x, prepared_attention, token_indices
+            )
+
+        aligned_logits = torch.cat(
+            [primary_output_logits[:, :1], primary_output_logits[:, :-1]], dim=1
         )
-        primary_logits = torch.cat(
-            [primary_logits[:, :1], primary_logits[:, :-1]], dim=1
-        )[mask_index]
+        primary_logits = aligned_logits[mask_index]
         primary_logits = primary_logits.clone()
         primary_logits[:, mask_token_id] = float("-inf")
         primary = sample_node_proposal(
@@ -209,14 +305,10 @@ def swarm_generate(
         )
 
         peers: list[NodeProposal] = []
-        peer_requested = enable_peer and dropout_generator.random() >= peer_dropout
-        if peer_requested:
+        if peer_output_logits is not None:
             try:
-                peer_logits = _model_logits(
-                    actual_peer_model, x, prepared_attention, token_indices
-                )
                 peer_logits = torch.cat(
-                    [peer_logits[:, :1], peer_logits[:, :-1]], dim=1
+                    [peer_output_logits[:, :1], peer_output_logits[:, :-1]], dim=1
                 )[mask_index]
                 peer_logits = peer_logits.clone()
                 peer_logits[:, mask_token_id] = float("-inf")
@@ -236,6 +328,7 @@ def swarm_generate(
         active_nodes_per_step.append(1 + len(peers))
         combined = combine_proposals(primary, peers)
         step_commits: list[TokenCommit] = []
+        visible_at_start = ~mask_index
 
         remaining = int(mask_index.sum().item())
         if step < steps - 1:
@@ -279,11 +372,37 @@ def swarm_generate(
                 )
             x[rows, transfer_index] = candidates[rows, transfer_index]
 
+        remasked_positions: list[int] = []
+        if (
+            remasked_tokens < remask_budget
+            and step < steps - 1
+        ):
+            eligible = visible_at_start.clone()
+            eligible[:, :prompt_length] = False
+            eligible &= ~remasked_once
+            eligible_positions = torch.nonzero(eligible[0], as_tuple=False).flatten()
+            if eligible_positions.numel() > 0:
+                scoring_logits = aligned_logits.clone()
+                scoring_logits[..., mask_token_id] = float("-inf")
+                token_log_probs = scoring_logits.gather(
+                    -1, x.unsqueeze(-1)
+                ).squeeze(-1) - torch.logsumexp(scoring_logits, dim=-1)
+                selected = eligible_positions[
+                    torch.argmin(token_log_probs[0, eligible_positions])
+                ]
+                position = int(selected.item())
+                x[0, position] = mask_token_id
+                remasked_once[0, position] = True
+                remasked_positions.append(position)
+                remasked_tokens += 1
+
         yield StepTrace(
             step=step,
             masks_remaining=int((x == mask_token_id).sum().item()),
             active_nodes=1 + len(peers),
             committed_tokens=tuple(step_commits),
+            elapsed_seconds=time.perf_counter() - step_started,
+            remasked_positions=tuple(remasked_positions),
         )
 
     if x.shape[1] != max_length or not torch.equal(
@@ -298,4 +417,5 @@ def swarm_generate(
         active_nodes_per_step=active_nodes_per_step,
         peer_wins=total_peer_wins,
         peer_failures=peer_failures,
+        remasked_tokens=remasked_tokens,
     )

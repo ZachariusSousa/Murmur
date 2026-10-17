@@ -1,4 +1,5 @@
 import unittest
+from threading import Barrier
 from types import SimpleNamespace
 
 import torch
@@ -78,6 +79,17 @@ class FailingPeer:
         raise RuntimeError("peer disappeared")
 
 
+class ConcurrentTinyModel(TinyModel):
+    def __init__(self, barrier):
+        self.barrier = barrier
+        self.inference_modes = []
+
+    def __call__(self, input_ids, attention_mask=None, token_indices=None):
+        self.inference_modes.append(torch.is_inference_mode_enabled())
+        self.barrier.wait(timeout=1)
+        return super().__call__(input_ids, attention_mask, token_indices)
+
+
 def completed_result(model, **kwargs):
     from swarm_sampler import swarm_generate
 
@@ -152,6 +164,26 @@ class SwarmGenerationTests(unittest.TestCase):
         self.assertEqual(result.active_nodes_per_step, [2, 2, 2, 2])
         self.assertGreater(result.peer_wins, 0)
 
+    def test_primary_and_distinct_peer_forwards_run_concurrently(self):
+        from swarm_sampler import swarm_generate
+
+        barrier = Barrier(2)
+        primary = ConcurrentTinyModel(barrier)
+        peer = ConcurrentTinyModel(barrier)
+        events = list(swarm_generate(
+            primary,
+            peer_model=peer,
+            enable_peer=True,
+            peer_dropout=0.0,
+            **self.common,
+        ))
+
+        result = events[-1]
+        self.assertEqual(result.active_nodes_per_step, [2, 2, 2, 2])
+        self.assertEqual(result.peer_failures, 0)
+        self.assertEqual(primary.inference_modes, [True] * 4)
+        self.assertEqual(peer.inference_modes, [True] * 4)
+
     def test_failed_peer_is_ignored(self):
         baseline = completed_result(TinyModel(), enable_peer=False, **self.common)
         with_failure = completed_result(
@@ -165,6 +197,41 @@ class SwarmGenerationTests(unittest.TestCase):
         self.assertTrue(torch.equal(baseline.sequences, with_failure.sequences))
         self.assertEqual(with_failure.active_nodes_per_step, [1, 1, 1, 1])
         self.assertEqual(with_failure.peer_failures, 4)
+
+    def test_remasking_reopens_generated_tokens_once_and_never_prompt(self):
+        from swarm_sampler import SwarmResult, swarm_generate
+
+        traces = list(swarm_generate(
+            TinyModel(), enable_peer=False, remask_fraction=0.5, **self.common
+        ))
+        result = traces[-1]
+        self.assertIsInstance(result, SwarmResult)
+        remasked = [
+            position
+            for trace in traces
+            if hasattr(trace, "remasked_positions")
+            for position in trace.remasked_positions
+        ]
+        self.assertGreater(result.remasked_tokens, 0)
+        self.assertLessEqual(result.remasked_tokens, 2)
+        self.assertTrue(all(len(trace.remasked_positions) <= 1 for trace in traces[:-1]))
+        self.assertEqual(len(remasked), len(set(remasked)))
+        self.assertTrue(all(position >= 2 for position in remasked))
+        self.assertNotIn(5, result.sequences[0, 2:].tolist())
+
+    def test_zero_remask_fraction_matches_unmodified_sampler(self):
+        baseline = completed_result(TinyModel(), enable_peer=False, **self.common)
+        disabled = completed_result(
+            TinyModel(), enable_peer=False, remask_fraction=0.0, **self.common
+        )
+        self.assertTrue(torch.equal(baseline.sequences, disabled.sequences))
+        self.assertEqual(disabled.remasked_tokens, 0)
+
+    def test_remask_fraction_below_one_token_does_not_round_up(self):
+        result = completed_result(
+            TinyModel(), enable_peer=False, remask_fraction=0.05, **self.common
+        )
+        self.assertEqual(result.remasked_tokens, 0)
 
 
 if __name__ == "__main__":

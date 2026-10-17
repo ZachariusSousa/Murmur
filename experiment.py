@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-import time
 
 import torch
 
@@ -37,6 +36,8 @@ class ScenarioResult:
     token_differences: int
     peak_allocated_gb: float
     peak_reserved_gb: float
+    remasked_tokens: int = 0
+    first_eos_position: int | None = None
 
 
 def _cuda_synchronize_if_available() -> bool:
@@ -47,27 +48,29 @@ def _cuda_synchronize_if_available() -> bool:
 
 
 def run_comparison(
-    args: object, model: object, tokenizer: object
+    args: object, model: object, tokenizer: object, *, peer_model: object | None = None
 ) -> Iterator[ExperimentProgress | ScenarioResult]:
-    """Yield live step events followed by each completed scenario result."""
+    """Yield progress/results while optionally coordinating two model copies."""
     device = getattr(model, "device", CUDA_DEVICE)
     input_ids, attention_mask = prepare_prompt(
         tokenizer, args.prompt, device=device
     )
     prompt_length = input_ids.shape[1]
+    remask_fraction = getattr(args, "remask_fraction", 0.05)
     scenarios = (
-        ("one-node baseline", False, 1.0),
-        ("two nodes, always available", True, 0.0),
-        (f"two nodes, dropout={args.peer_dropout:.2f}", True, args.peer_dropout),
+        ("one-node baseline", False, 1.0, 0.0),
+        ("two nodes, always available", True, 0.0, 0.0),
+        (f"two nodes, dropout={args.peer_dropout:.2f}", True, args.peer_dropout, 0.0),
+        (f"one-node, remask={remask_fraction:.0%}", False, 1.0, remask_fraction),
     )
     baseline_tokens: torch.Tensor | None = None
 
-    for scenario, enable_peer, peer_dropout in scenarios:
+    for scenario, enable_peer, peer_dropout, scenario_remask_fraction in scenarios:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             reset_cuda_peak_memory(torch)
         _cuda_synchronize_if_available()
-        started = time.perf_counter()
+        scenario_elapsed = 0.0
         result: SwarmResult | None = None
 
         for event in swarm_generate(
@@ -83,20 +86,31 @@ def run_comparison(
             peer_seed=args.seed + 1,
             enable_peer=enable_peer,
             peer_dropout=peer_dropout,
+            remask_fraction=scenario_remask_fraction,
+            peer_model=peer_model,
         ):
             if isinstance(event, StepTrace):
+                scenario_elapsed += event.elapsed_seconds
                 yield ExperimentProgress(scenario=scenario, trace=event)
             else:
                 result = event
 
         _cuda_synchronize_if_available()
-        elapsed = time.perf_counter() - started
         if result is None:
             raise RuntimeError(f"{scenario} ended without a final sampler result")
 
         text = decode_response(tokenizer, result.sequences, prompt_length)
         validate_generated_text(text, tokenizer.mask_token)
         output_tokens = result.sequences[:, prompt_length:].detach().clone()
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        eos_positions = (
+            torch.nonzero(output_tokens[0] == eos_token_id, as_tuple=False).flatten()
+            if eos_token_id is not None
+            else torch.empty(0, dtype=torch.long, device=output_tokens.device)
+        )
+        first_eos_position = (
+            int(eos_positions[0].item()) if eos_positions.numel() else None
+        )
         if baseline_tokens is None:
             baseline_tokens = output_tokens
             token_differences = 0
@@ -112,11 +126,13 @@ def run_comparison(
         yield ScenarioResult(
             scenario=scenario,
             text=text,
-            elapsed_seconds=elapsed,
+            elapsed_seconds=scenario_elapsed,
             active_nodes_per_step=tuple(result.active_nodes_per_step),
             peer_commits=result.peer_wins,
             peer_failures=result.peer_failures,
             token_differences=token_differences,
             peak_allocated_gb=peak_allocated,
             peak_reserved_gb=peak_reserved,
+            remasked_tokens=result.remasked_tokens,
+            first_eos_position=first_eos_position,
         )
